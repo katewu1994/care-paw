@@ -1,0 +1,241 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function householdPath(householdId) {
+      return /databases/$(database)/documents/households/$(householdId);
+    }
+
+    function memberPath(householdId, caregiverId) {
+      return /databases/$(database)/documents/households/$(householdId)/members/$(caregiverId);
+    }
+
+    function joinRequestPath(householdId, caregiverId) {
+      return /databases/$(database)/documents/households/$(householdId)/joinRequests/$(caregiverId);
+    }
+
+    function invitationPath(invitationId) {
+      return /databases/$(database)/documents/invitations/$(invitationId);
+    }
+
+    function isMember(householdId) {
+      return signedIn() && exists(memberPath(householdId, request.auth.uid));
+    }
+
+    function isOwner(householdId) {
+      return isMember(householdId) &&
+          (get(memberPath(householdId, request.auth.uid)).data.get('role', 'caregiver') == 'owner' ||
+           !('ownerId' in get(householdPath(householdId)).data));
+    }
+
+    // Includes writes that create the household and its first owner atomically.
+    function isOwnerAfter(householdId) {
+      return signedIn() &&
+          getAfter(householdPath(householdId)).data.ownerId == request.auth.uid &&
+          getAfter(memberPath(householdId, request.auth.uid)).data.userId == request.auth.uid &&
+          getAfter(memberPath(householdId, request.auth.uid)).data.role == 'owner';
+    }
+
+    function validHousehold(data) {
+      return data.name is string &&
+          data.pets is list &&
+          data.pets.size() > 0 &&
+          data.pets.size() <= 20 &&
+          (!('ownerId' in data) || data.ownerId is string);
+    }
+
+    function validMember(data, caregiverId) {
+      return data.userId == caregiverId &&
+          data.name is string &&
+          (!('email' in data) || data.email is string) &&
+          (data.role == 'owner' || data.role == 'caregiver');
+    }
+
+    function validInvitation(data) {
+      return data.householdId is string &&
+          data.householdName is string &&
+          data.petNames is list &&
+          data.petNames.size() > 0 &&
+          data.petNames.size() <= 20 &&
+          data.invitedBy == request.auth.uid &&
+          data.inviterName is string &&
+          data.status == 'active' &&
+          data.createdAt is timestamp &&
+          data.expiresAt is timestamp &&
+          data.expiresAt > request.time &&
+          data.expiresAt <= request.time + duration.value(24, 'h');
+    }
+
+    function validPendingJoin(data, caregiverId, householdId) {
+      return signedIn() &&
+          caregiverId == request.auth.uid &&
+          data.keys().hasOnly([
+            'userId', 'name', 'inviteId', 'invitedBy', 'status', 'createdAt'
+          ]) &&
+          data.userId == request.auth.uid &&
+          data.name is string &&
+          data.inviteId is string &&
+          data.invitedBy is string &&
+          data.status == 'pending' &&
+          data.createdAt == request.time &&
+          getAfter(invitationPath(data.inviteId)).data.householdId == householdId &&
+          getAfter(invitationPath(data.inviteId)).data.status == 'claimed' &&
+          getAfter(invitationPath(data.inviteId)).data.claimedBy == request.auth.uid;
+    }
+
+    // Session restore uses collection-group queries. Queries must include the
+    // same userId/status filters required below.
+    match /{path=**}/members/{caregiverId} {
+      allow list: if signedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /{path=**}/joinRequests/{caregiverId} {
+      allow list: if signedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    match /invitations/{invitationId} {
+      // Invitations contain preview-only data. Exact lookup is allowed but
+      // enumeration is blocked.
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() &&
+          isOwner(request.resource.data.householdId) &&
+          validInvitation(request.resource.data);
+
+      // The exact-link holder may claim an active invitation once. The same
+      // transaction must create their pending join request.
+      allow update: if signedIn() &&
+          resource.data.status == 'active' &&
+          request.time < resource.data.expiresAt &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'claimedBy', 'claimedName', 'claimedAt'
+          ]) &&
+          request.resource.data.status == 'claimed' &&
+          request.resource.data.claimedBy == request.auth.uid &&
+          request.resource.data.claimedName is string &&
+          request.resource.data.claimedAt == request.time &&
+          getAfter(joinRequestPath(resource.data.householdId, request.auth.uid)).data.inviteId == invitationId &&
+          getAfter(joinRequestPath(resource.data.householdId, request.auth.uid)).data.status == 'pending';
+
+      // Owners can revoke an unused invitation or close a claimed invitation
+      // as part of approving/rejecting its request.
+      allow update: if isOwner(resource.data.householdId) &&
+          ((resource.data.status == 'active' &&
+            request.resource.data.status == 'revoked' &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'status', 'revokedAt'
+            ]) && request.resource.data.revokedAt == request.time) ||
+           (resource.data.status == 'claimed' &&
+            (request.resource.data.status == 'approved' ||
+             request.resource.data.status == 'rejected') &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'status', 'reviewedBy', 'reviewedAt'
+            ]) &&
+            request.resource.data.reviewedBy == request.auth.uid &&
+            request.resource.data.reviewedAt == request.time));
+      allow delete: if false;
+    }
+
+    match /households/{householdId} {
+      allow create: if signedIn() &&
+          validHousehold(request.resource.data) &&
+          request.resource.data.ownerId == request.auth.uid &&
+          isOwnerAfter(householdId);
+      allow get: if isMember(householdId);
+      allow list, delete: if false;
+      allow update: if isOwner(householdId) &&
+          validHousehold(request.resource.data) &&
+          ((!('ownerId' in request.resource.data) &&
+            !('ownerId' in resource.data)) ||
+           ('ownerId' in request.resource.data &&
+            'ownerId' in resource.data &&
+            request.resource.data.ownerId == resource.data.ownerId));
+
+      match /members/{caregiverId} {
+        allow get: if isMember(householdId) ||
+            (signedIn() && caregiverId == request.auth.uid);
+        allow list: if isMember(householdId) ||
+            (signedIn() && resource.data.userId == request.auth.uid);
+
+        // New households create their owner atomically. All later members are
+        // created by the owner only after an approved join request.
+        allow create: if validMember(request.resource.data, caregiverId) &&
+            ((signedIn() &&
+              caregiverId == request.auth.uid &&
+              request.resource.data.role == 'owner' &&
+              isOwnerAfter(householdId)) ||
+             (isOwner(householdId) &&
+              request.resource.data.role == 'caregiver' &&
+              getAfter(joinRequestPath(householdId, caregiverId)).data.status == 'approved' &&
+              getAfter(joinRequestPath(householdId, caregiverId)).data.reviewedBy == request.auth.uid));
+
+        // Members may edit their own display/notification settings, never
+        // their identity or role.
+        allow update: if signedIn() &&
+            caregiverId == request.auth.uid &&
+            request.resource.data.userId == resource.data.userId &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'name', 'notificationsEnabled', 'notificationUpdatedAt', 'updatedAt'
+            ]);
+
+        allow delete: if (signedIn() &&
+            caregiverId == request.auth.uid &&
+            resource.data.get('role', 'caregiver') != 'owner') ||
+            (isOwner(householdId) &&
+             caregiverId != request.auth.uid &&
+             resource.data.get('role', 'caregiver') == 'caregiver');
+
+        match /devices/{deviceId} {
+          allow get, list, create, update, delete: if signedIn() &&
+              caregiverId == request.auth.uid &&
+              isMember(householdId);
+        }
+      }
+
+      match /joinRequests/{caregiverId} {
+        allow get: if (signedIn() && caregiverId == request.auth.uid) ||
+            isOwner(householdId);
+        allow list: if isOwner(householdId) ||
+            (signedIn() && resource.data.userId == request.auth.uid);
+
+        allow create: if validPendingJoin(
+            request.resource.data, caregiverId, householdId);
+
+        allow update: if
+            (signedIn() &&
+             caregiverId == request.auth.uid &&
+             (resource.data.status == 'approved' ||
+              resource.data.status == 'rejected') &&
+             !exists(memberPath(householdId, request.auth.uid)) &&
+             validPendingJoin(
+               request.resource.data, caregiverId, householdId)) ||
+            (isOwner(householdId) &&
+             resource.data.status == 'pending' &&
+             (request.resource.data.status == 'approved' ||
+              request.resource.data.status == 'rejected') &&
+             request.resource.data.reviewedBy == request.auth.uid &&
+             request.resource.data.reviewedAt == request.time &&
+             request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+               'status', 'reviewedBy', 'reviewedAt'
+             ]));
+        allow delete: if signedIn() &&
+            caregiverId == request.auth.uid &&
+            resource.data.status == 'pending';
+      }
+
+      match /routines/{routineId} {
+        allow read: if isMember(householdId);
+        allow create, update, delete: if isMember(householdId);
+      }
+
+      match /tasks/{taskId} {
+        allow read: if isMember(householdId);
+        allow create, update, delete: if isMember(householdId);
+      }
+    }
+  }
+}
